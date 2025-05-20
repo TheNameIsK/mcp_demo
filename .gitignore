@@ -1,0 +1,26 @@
+sse_trial/
+stdio_only/
+
+# Ignore all virtual environments
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+
+# Ignore Python compiled files
+**/*.pyc
+
+# Ignore environment variable files
+**/.env
+
+# Ignore credentials and sensitive keys
+**/serviceAccountKey.json
+
+# Ignore lock files (optional)
+**/uv.lock
+
+# Ignore temporary or test data
+**/db.json
+**/db_*.json
+
+# VS Code settings (optional)
+.vscode/
