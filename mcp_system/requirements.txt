@@ -1,0 +1,7 @@
+firebase-admin
+python-dotenv
+mcp
+uv
+streamlit
+openai
+nest_asyncio

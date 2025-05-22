@@ -14,6 +14,7 @@ stdio_only/
 
 # Ignore credentials and sensitive keys
 **/serviceAccountKey.json
+**/serviceAccountKey_masM.json
 
 # Ignore lock files (optional)
 **/uv.lock
