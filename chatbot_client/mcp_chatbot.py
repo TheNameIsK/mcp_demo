@@ -136,10 +136,10 @@ class MCP_ChatBot:
         print("\nMCP Chatbot Started!")
         print("Type your query or 'quit' to exit.")
         print("Type /reset to clear conversation memory.")
-
+        
         while True:
             try:
-                query = input("\nQuery: ").strip()
+                query = input("\n--------------------------------\nQuery: ").strip()
                 if not query:
                     continue
                 if query.lower() == "quit":
