@@ -103,7 +103,3 @@ Ask questions via the UI and let the OpenAI model invoke tools registered on you
     ├── .env                       # Firebase credential reference
     ├── requirements.txt           # Dependencies
     └── README.txt                 # This file
-
-## Contact
-
-For internal AI integration or technical support, please reach out to the AI Engineering team.
