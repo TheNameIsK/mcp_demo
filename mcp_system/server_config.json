@@ -4,9 +4,9 @@
         "url": "http://localhost:8003",
         "name": "server_transactions"
       },
-      "user-server": {
+      "supabase_server": {
         "url": "http://localhost:8004",
-        "name": "server_users"
+        "name":"supa_server"
       }
     }
   }

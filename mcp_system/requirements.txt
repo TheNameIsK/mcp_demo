@@ -5,3 +5,6 @@ uv
 streamlit
 openai
 nest_asyncio
+matplotlib
+seaborn
+pandas
