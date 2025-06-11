@@ -53,8 +53,9 @@ A powerful Model Context Protocol (MCP) system that provides intelligent data an
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/mcp-firebase-supabase-system.git
-cd mcp-firebase-supabase-system
+git clone https://github.com/your-username/mcp-demo.git
+cd mcp-demo
+cd mcp-system
 ```
 
 ### 2. Create Virtual Environment
@@ -105,20 +106,6 @@ LOG_LEVEL=INFO
 3. Go to Settings → Database
 4. Copy the connection string
 5. Update the `SUPABASE_CONNECTION_STRING` in your `.env` file
-
-### 7. Server Configuration
-
-Create a `server_config.json` file:
-
-```json
-{
-  "mcpServers": {
-    "unified-firebase-supabase": {
-      "url": "http://localhost:8005"
-    }
-  }
-}
-```
 
 ## 🏃‍♂️ Running the System
 
