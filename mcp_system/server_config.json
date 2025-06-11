@@ -1,12 +1,8 @@
 {
     "mcpServers": {
-      "firebase_server": {
-        "url": "http://localhost:8003",
-        "name": "server_transactions"
-      },
-      "supabase_server": {
-        "url": "http://localhost:8004",
-        "name":"supa_server"
+      "supa_fire_server": {
+        "url": "http://localhost:8005",
+        "name":"combined_server"
       }
     }
   }
