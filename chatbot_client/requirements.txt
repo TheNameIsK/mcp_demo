@@ -1,6 +1,0 @@
-streamlit
-openai
-python-dotenv
-mcp
-nest_asyncio
-uv

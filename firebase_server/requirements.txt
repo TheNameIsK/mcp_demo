@@ -1,4 +1,0 @@
-firebase-admin
-python-dotenv
-mcp
-uv

@@ -1,5 +1,10 @@
 sse_trial/
 stdio_only/
+firebase_server/
+sap_server/
+user_server/
+chatbot_client/
+mcp_price_estimation/
 
 # Ignore all virtual environments
 **/.venv/

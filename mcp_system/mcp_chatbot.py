@@ -7,6 +7,11 @@ import json
 import asyncio
 import nest_asyncio
 import os
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
+import threading
+from contextlib import contextmanager
 
 nest_asyncio.apply()
 load_dotenv()
@@ -19,184 +24,237 @@ class MCP_ChatBot:
         self.available_prompts = []
         self.sessions = {}
         self.messages = []
-        self.prompt = """
-    You are an expert data analyst with access to multiple data sources through specialized MCP (Model Context Protocol) servers. Your role is to provide comprehensive, insightful analysis while being extremely mindful of computational resources and token efficiency.
+        self.database_schema = None
+        self._connection_pool = None
+        self._pool_lock = threading.Lock()
 
-    ## CRITICAL: Context Awareness & Tool Efficiency
+    def get_connection_pool(self):
+        """Get or create the database connection pool"""
+        database_url = os.getenv("SUPABASE_CONNECTION_STRING")
+        
+        if not database_url:
+            return None
+        
+        with self._pool_lock:
+            if self._connection_pool is None:
+                try:
+                    self._connection_pool = ThreadedConnectionPool(
+                        minconn=1,
+                        maxconn=3,
+                        dsn=database_url
+                    )
+                except Exception as e:
+                    print(f"Failed to create database connection pool: {e}")
+                    return None
+        
+        return self._connection_pool
 
-    ### BEFORE MAKING ANY TOOL CALL:
-    1. **Check Conversation History**: Review what data has already been retrieved
-    2. **Assess Available Information**: Determine if you have sufficient data to proceed with analysis
-    3. **Avoid Redundant Calls**: NEVER call list/retrieval tools if equivalent data exists in context
-    4. **Maximize Existing Data**: Extract maximum insights from already-available information
+    @contextmanager
+    def get_db_connection(self):
+        """Context manager for database connections with connection pooling"""
+        pool = self.get_connection_pool()
+        if not pool:
+            raise Exception("Database connection pool not available")
+        
+        conn = None
+        try:
+            conn = pool.getconn()
+            yield conn
+        finally:
+            if conn:
+                pool.putconn(conn)
 
-    ### Tool Call Decision Matrix:
-    - ✅ **Make Tool Call**: Only when essential new data is needed
-    - ❌ **Skip Tool Call**: When similar/sufficient data already exists in conversation
-    - 🔄 **Transform Existing Data**: Use context data for analysis instead of fetching new data
+    def execute_safe_query(self, query: str, params: tuple = None):
+        """Execute a read-only query safely"""
+        with self.get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(query, params)
+                return [dict(row) for row in cursor.fetchall()]
 
-    ## Available Data Sources
+    async def load_database_schema(self, schemas=['public']):
+        """Load database schema information"""
+        try:
+            print("Loading database schema...")
+            
+            schema_info = {
+                "schemas": {},
+                "summary": {
+                    "total_schemas": 0,
+                    "total_tables": 0,
+                    "total_columns": 0,
+                    "total_foreign_keys": 0
+                }
+            }
+            
+            for schema_name in schemas:
+                schema_data = await self.get_single_schema_details(schema_name)
+                if schema_data:
+                    schema_info["schemas"][schema_name] = schema_data
+                    
+                    # Update summary
+                    schema_info["summary"]["total_schemas"] += 1
+                    schema_info["summary"]["total_tables"] += len(schema_data.get("tables", {}))
+                    schema_info["summary"]["total_columns"] += sum(
+                        len(table.get("columns", [])) for table in schema_data.get("tables", {}).values()
+                    )
+                    schema_info["summary"]["total_foreign_keys"] += len(schema_data.get("foreign_keys", []))
+            
+            self.database_schema = schema_info
+            print(f"✅ Schema loaded: {schema_info['summary']['total_tables']} tables, {schema_info['summary']['total_columns']} columns")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to load database schema: {str(e)}")
+            self.database_schema = None
+            return False
 
-    ### Firebase Analytics Server (Port 8003)
-    - **Collections**: Document-based NoSQL data with flexible schemas
-    - **Key Tools**: 
-    - `firebase_list_collections()` - List available collections
-    - `firebase_get_collection_stats()` - Comprehensive collection analytics
-    - `firebase_analyze_file_patterns()` - Pattern analysis and trends
-    - `firebase_list_files_sample()` - Paginated data sampling
-    - `firebase_search_and_filter()` - Advanced filtering with context
-    - `firebase_compare_time_periods()` - Temporal comparisons
-    - `firebase_create_chart()` - Create visualization for firebase data
+    async def get_single_schema_details(self, schema_name: str):
+        """Get detailed information for a single schema"""
+        
+        # Query for tables and columns
+        tables_query = """
+            SELECT
+                t.table_name,
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                c.ordinal_position,
+                CASE
+                    WHEN pk.constraint_type = 'PRIMARY KEY' THEN true
+                    ELSE false
+                END AS is_primary_key
+            FROM
+                information_schema.tables t
+            JOIN
+                information_schema.columns c ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+            LEFT JOIN (
+                SELECT
+                    tc.table_schema,
+                    tc.table_name,
+                    ccu.column_name,
+                    tc.constraint_type
+                FROM
+                    information_schema.table_constraints tc
+                JOIN
+                    information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
+                WHERE
+                    tc.constraint_type = 'PRIMARY KEY'
+            ) pk ON t.table_schema = pk.table_schema AND t.table_name = pk.table_name AND c.column_name = pk.column_name
+            WHERE
+                t.table_schema = %s AND t.table_type = 'BASE TABLE'
+            ORDER BY
+                t.table_name, c.ordinal_position;
+        """
+        
+        # Query for foreign keys
+        fk_query = """
+            SELECT
+                tc.table_name AS source_table,
+                kcu.column_name AS source_column,
+                ccu.table_name AS target_table,
+                ccu.column_name AS target_column,
+                tc.constraint_name
+            FROM
+                information_schema.table_constraints AS tc
+            JOIN
+                information_schema.key_column_usage AS kcu
+                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+            JOIN
+                information_schema.constraint_column_usage AS ccu
+                ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+            WHERE
+                tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = %s;
+        """
+        
+        try:
+            # Get tables and columns
+            tables_data = self.execute_safe_query(tables_query, (schema_name,))
+            
+            # Organize table information
+            tables = {}
+            for row in tables_data:
+                table_name = row['table_name']
+                if table_name not in tables:
+                    tables[table_name] = {
+                        "columns": [],
+                        "primary_keys": []
+                    }
+                
+                column_info = {
+                    "name": row['column_name'],
+                    "data_type": row['data_type'],
+                    "is_nullable": row['is_nullable'] == 'YES',
+                    "default": row['column_default'],
+                    "position": row['ordinal_position'],
+                    "is_primary_key": row['is_primary_key']
+                }
+                
+                tables[table_name]["columns"].append(column_info)
+                
+                if row['is_primary_key']:
+                    tables[table_name]["primary_keys"].append(row['column_name'])
+            
+            # Get foreign keys
+            fk_data = self.execute_safe_query(fk_query, (schema_name,))
+            foreign_keys = []
+            for row in fk_data:
+                foreign_keys.append({
+                    "constraint_name": row['constraint_name'],
+                    "source_table": row['source_table'],
+                    "source_column": row['source_column'],
+                    "target_table": row['target_table'],
+                    "target_column": row['target_column']
+                })
+            
+            return {
+                "tables": tables,
+                "foreign_keys": foreign_keys
+            }
+            
+        except Exception as e:
+            print(f"Error getting schema details for {schema_name}: {e}")
+            return {}
 
-    ### Supabase Analytics Server (Port 8004)
-    - **Tables**: Structured PostgreSQL data with rich querying capabilities
-    - **Key Tools**:
-    - `supabase_list_tables()` - List available tables
-    - `supabase_get_table_analytics()` - Comprehensive table analytics
-    - `supabase_analyze_data_patterns()` - Pattern and distribution analysis
-    - `supabase_list_files_paginated()` - Efficient paginated access
-    - `supabase_search_and_filter()` - Advanced SQL-based filtering
-    - `supabase_compare_time_periods()` - Temporal analysis
-    - `supabase_aggregate_analysis()` - Grouping and aggregation analysis
-    - `supabase_create_chart()` - Create visualization for supabase data
-
-    ## Ultra-Efficient Analysis Workflow
-
-    ### Phase 1: Context Assessment (0 tool calls if data exists)
-    1. **Review Conversation**: What data is already available?
-    2. **Inventory Check**: List datasets, samples, and statistics already retrieved
-    3. **Gap Analysis**: Identify only essential missing information
-    4. **Tool Selection**: Choose minimum necessary tools for gaps
-
-    ### Phase 2: Strategic Data Gathering (1-2 tool calls max)
-    **Only proceed if Phase 1 reveals critical gaps**
-    1. **Prioritize Analytics Tools**: Use comprehensive stats/analytics tools over sampling
-    2. **Smart Aggregation**: Choose aggregate analysis over individual record retrieval
-    3. **Pattern Tools**: Use pattern analysis tools over raw data listing
-
-    ### Phase 3: Deep Analysis Using Context (0 additional tool calls)
-    **Maximize analysis from already-retrieved data:**
-    1. **Statistical Analysis**: Extract distributions, trends, anomalies from existing data
-    2. **Pattern Recognition**: Identify usage patterns, temporal trends, organizational insights
-    3. **Quality Assessment**: Evaluate completeness, consistency, validity from available samples
-    4. **Comparative Analysis**: Compare across time periods, users, categories using context data
-
-    ### Phase 4: Targeted Validation (0-1 tool calls max)
-    **Only if critical findings need verification**
-    - Use specific search/filter tools to validate key insights
-    - Focus on unexpected patterns that need confirmation
-
-    ## Context-First Analysis Strategy
-
-    ### When You Have File Lists/Samples:
-    **Instead of fetching more files, analyze what you have:**
-    - File naming patterns and conventions
-    - Creation date distributions and trends
-    - Owner/creator patterns and collaboration insights
-    - Folder organization and categorization effectiveness
-    - File type distributions and content patterns
-    - Size patterns and storage utilization
-
-    ### When You Have Statistics/Analytics:
-    **Extract maximum insights from metrics:**
-    - Growth trends and adoption patterns
-    - User engagement and activity levels
-    - Data quality indicators and completeness
-    - Performance and efficiency metrics
-    - Comparative analysis across segments
-
-    ### When You Have Pattern Analysis:
-    **Build comprehensive understanding:**
-    - Temporal usage patterns and seasonality
-    - User behavior classifications
-    - Organizational structure effectiveness
-    - Content lifecycle patterns
-    - Collaboration and sharing patterns
-
-    ## Smart Analysis Techniques
-
-    ### Statistical Analysis from Samples:
-    - **Extrapolation**: Project sample insights to full dataset
-    - **Distribution Analysis**: Understand data patterns from partial views
-    - **Trend Analysis**: Identify patterns from time-series samples
-    - **Anomaly Detection**: Spot outliers and unusual patterns
-
-    ### Pattern Recognition:
-    - **Clustering**: Group similar entities/behaviors from available data
-    - **Correlation Analysis**: Find relationships between variables
-    - **Sequence Analysis**: Understand workflows and user journeys
-    - **Categorization**: Classify and segment based on observed patterns
-
-    ### Quality Assessment:
-    - **Completeness Scoring**: Assess field coverage from samples
-    - **Consistency Evaluation**: Check format standardization
-    - **Validity Testing**: Validate data ranges and types
-    - **Uniqueness Analysis**: Detect duplicates and key field integrity
-
-    ## Output Structure
-
-    ### Context Utilization Summary
-    Brief statement of what existing data was leveraged for analysis
-
-    ### Executive Summary (2-3 sentences)
-    Key findings and data health overview based on available information
-
-    ### Data Overview
-    - Dataset scope based on retrieved statistics
-    - Coverage analysis from available samples
-    - Entity counts and distributions from context
-
-    ### Key Insights
-    - **Quality Insights**: Based on sample analysis and statistics
-    - **Usage Patterns**: Derived from temporal and user data in context
-    - **Organizational Insights**: Structure analysis from available information
-    - **Anomalies**: Unusual patterns identified from existing data
-
-    ### Recommendations
-    - **Data Quality**: Improvements based on observed patterns
-    - **Organizational**: Structure optimizations from analysis
-    - **Performance**: Efficiency improvements identified
-    - **Monitoring**: Key metrics to track going forward
-
-    ### Analysis Methodology
-    - What context data was used
-    - Analytical techniques applied
-    - Sample sizes and coverage
-    - Limitations and confidence levels
-
-    ## Redundancy Prevention Rules
-
-    ### NEVER Call Tools If:
-    - Similar data already exists in conversation history
-    - Sufficient information is available for meaningful analysis
-    - The same collection/table was recently examined
-    - Pattern analysis can be done with existing samples
-
-    ### ALWAYS Analyze First:
-    - Extract maximum value from available context
-    - Perform statistical analysis on existing samples
-    - Identify patterns in retrieved data
-    - Generate insights from current information
-
-    ### Only Call Tools When:
-    - Critical data gaps prevent meaningful analysis
-    - Specific validation is needed for key findings
-    - Time-period comparisons require additional data
-    - Aggregation analysis needs specific groupings
-
-    ## Error Prevention
-    - State clearly when analysis is based on existing context vs. new data retrieval
-    - Acknowledge limitations of sample-based analysis
-    - Specify confidence levels based on data coverage
-    - Suggest what additional data would improve insights (without fetching it)
-
-    Remember: Your primary goal is to extract maximum analytical value from existing conversation context. Only make tool calls when absolutely essential for meaningful insights. Focus on intelligent analysis of available data rather than comprehensive data collection.
-    """
-        self.messages = [{
-            "role": "system",
-            "content": (self.prompt)
-        }]
-
+    def format_schema_for_prompt(self):
+        """Format database schema for system prompt"""
+        if not self.database_schema or not self.database_schema.get("schemas"):
+            return "No database schema available. Cannot perform Supabase database operations."
+        
+        content = "# DATABASE SCHEMA INFORMATION\n\n"
+        content += "You have access to the following Supabase PostgreSQL database schema. "
+        content += "Use this information to construct accurate SQL queries when using database tools.\n\n"
+        
+        for schema_name, schema_data in self.database_schema["schemas"].items():
+            content += f"## Schema: {schema_name}\n\n"
+            
+            # Tables section
+            content += "### Tables and Columns:\n\n"
+            for table_name, table_info in schema_data.get("tables", {}).items():
+                content += f"**{table_name}**\n"
+                
+                # Columns
+                for col in table_info.get("columns", []):
+                    pk_marker = " (PRIMARY KEY)" if col["is_primary_key"] else ""
+                    nullable = "NULL" if col["is_nullable"] else "NOT NULL"
+                    default = f" DEFAULT {col['default']}" if col["default"] else ""
+                    content += f"  - {col['name']}: {col['data_type']}{pk_marker} {nullable}{default}\n"
+                
+                content += "\n"
+            
+            # Foreign keys section
+            if schema_data.get("foreign_keys"):
+                content += "### Foreign Key Relationships:\n"
+                for fk in schema_data["foreign_keys"]:
+                    content += f"- {fk['source_table']}.{fk['source_column']} → {fk['target_table']}.{fk['target_column']}\n"
+                content += "\n"
+        
+        # Summary
+        summary = self.database_schema["summary"]
+        content += f"**Summary:** {summary['total_tables']} tables, {summary['total_columns']} columns, {summary['total_foreign_keys']} foreign keys\n\n"
+        content += "IMPORTANT: Always reference this schema when constructing SQL queries. If no schema is provided above, inform the user that database operations are not available.\n"
+        
+        return content
 
     async def connect_to_server(self, server_name, server_config):
         try:
@@ -250,7 +308,76 @@ class MCP_ChatBot:
             print(f"Error loading server config: {e}")
             raise
 
+    async def call_tool(self, tool_name: str, arguments: dict):
+        """Call a specific MCP tool by name"""
+        session = self.sessions.get(tool_name)
+        if not session:
+            return {"success": False, "error": f"Tool '{tool_name}' not found"}
+        
+        try:
+            result = await session.call_tool(tool_name, arguments=arguments)
+            # Try to parse the result as JSON for better handling
+            try:
+                parsed_result = json.loads(str(result.content))
+                return parsed_result
+            except:
+                # If it's not JSON, return as is
+                return {"success": True, "result": str(result.content)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_system_prompt(self):
+        """Get enhanced system prompt with database schema and context memory emphasis"""
+        schema_info = self.format_schema_for_prompt()
+        
+        system_prompt = f"""You are an intelligent data analysis assistant with access to Firebase and Supabase databases through MCP tools.
+
+## CONTEXT MEMORY PRIORITY
+**CRITICAL:** Always leverage conversation history and previous tool results. Build upon prior information instead of starting fresh each time.
+
+## FIREBASE OPERATIONS (No SQL - Use Context!)
+For Firebase tools, ALWAYS remember and reference:
+- Collection names from previous firebase_list_collections calls
+- Field structures from firebase_get_collection_stats results  
+- Document IDs and data from firebase_list_files_sample calls
+- Analysis patterns from firebase_analyze_file_patterns results
+
+**Firebase Workflow Strategy:**
+1. If collection info isn't in memory → Use firebase_list_collections
+2. If field structure unknown → Use firebase_get_collection_stats  
+3. Build filters/searches using remembered field names and structures
+4. Reference previous analysis results to avoid redundant calls
+
+## SUPABASE OPERATIONS (SQL-Based)
+{schema_info}
+
+For Supabase queries:
+- Use schema information above for accurate SQL construction
+- Remember table relationships and join patterns from previous queries
+- Build upon previous query results for follow-up analysis
+
+## INTELLIGENT TOOL USAGE
+- **Avoid redundant calls** - Check conversation history first
+- **Chain operations** - Use results from one tool to inform the next
+- **Provide context** - Explain what you remember from previous interactions
+- **Be efficient** - Combine multiple insights from single tool calls
+
+## RESPONSE PATTERN
+1. Acknowledge what you remember from context
+2. Identify what additional information is needed
+3. Use tools strategically based on conversation history
+4. Synthesize new results with previous findings
+
+Always prioritize using existing context over making new tool calls when possible."""
+
+        return system_prompt
+
     async def process_query(self, query):
+        # Add system prompt as the first message if not already present
+        if not self.messages or self.messages[0].get('role') != 'system':
+            system_prompt = self.get_system_prompt()
+            self.messages.insert(0, {'role': 'system', 'content': system_prompt})
+        
         self.messages.append({'role': 'user', 'content': query})
 
         while True:
@@ -314,6 +441,9 @@ class MCP_ChatBot:
         print("\nMCP Chatbot Started!")
         print("Type your query or 'quit' to exit.")
         print("Type /reset to clear conversation memory.")
+        print("Type /cc to clear tool call cache.")
+        print("Type /schema to display current database schema.")
+        print("Type /memory to see conversation context.")
         
         while True:
             try:
@@ -326,17 +456,52 @@ class MCP_ChatBot:
                     self.messages = []
                     print("✅ Memory has been reset.")
                     continue
+                if query.lower() == "/schema":
+                    if self.database_schema:
+                        print("\n" + self.format_schema_for_prompt())
+                    else:
+                        print("❌ No database schema loaded.")
+                    continue
+                if query.lower() == "/memory":
+                    print(f"\n📝 Conversation has {len(self.messages)} messages")
+                    print("Recent context:")
+                    for msg in self.messages[-5:]:
+                        role = msg.get('role', 'unknown')
+                        content = msg.get('content', '')[:100] + "..." if len(msg.get('content', '')) > 100 else msg.get('content', '')
+                        print(f"  {role}: {content}")
+                    continue
+                if query.lower() == "/cc":
+                    # Try to use the MCP tool first
+                    if "clear_cache" in self.sessions:
+                        try:
+                            result = await self.call_tool("clear_cache", {})
+                            print(f"✅ Server cache cleared: {result}")
+                        except Exception as e:
+                            print(f"❌ Error clearing server cache: {e}")
+                    else:
+                        print("❌ clear_cache tool not available on server.")
+                    continue
                 await self.process_query(query)
             except Exception as e:
                 print(f"Error: {e}")
 
     async def cleanup(self):
         await self.exit_stack.aclose()
+        # Cleanup database connections
+        if self._connection_pool:
+            with self._pool_lock:
+                self._connection_pool.closeall()
 
 async def main():
     chatbot = MCP_ChatBot()
     try:
+        # Load database schema first
+        await chatbot.load_database_schema()
+        
+        # Then connect to MCP servers
         await chatbot.connect_to_servers()
+        
+        # Start chat loop
         await chatbot.chat_loop()
     finally:
         await chatbot.cleanup()
